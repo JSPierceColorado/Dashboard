@@ -1,0 +1,7 @@
+alpaca-py
+python-kraken-sdk
+oandapyV20
+gspread
+google-auth
+pytz
+requests
