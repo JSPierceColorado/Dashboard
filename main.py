@@ -26,6 +26,8 @@ ALPACA_PAPER                = true/false (default: true)
 KRAKEN_API_KEY
 KRAKEN_API_SECRET
 KRAKEN_BASE_ASSET           = ZUSD by default (base currency for TradeBalance)
+KRAKEN_EARN_CONVERTED_ASSET = optional; currency (e.g. USD, ZUSD) to express staked/Earn value.
+                              If not set, Kraken's default is used (typically USD).
 
 OANDA_API_KEY
 OANDA_ACCOUNT_ID
@@ -47,6 +49,12 @@ from google.oauth2.service_account import Credentials
 
 from alpaca.trading.client import TradingClient
 from kraken.spot import User as KrakenUser
+try:
+    # Earn client may not exist in older python-kraken-sdk versions; handle gracefully.
+    from kraken.spot import Earn as KrakenEarn  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    KrakenEarn = None  # type: ignore[assignment]
+
 import oandapyV20
 import oandapyV20.endpoints.accounts as oanda_accounts
 
@@ -131,13 +139,17 @@ def get_alpaca_snapshot():
 
 
 def get_kraken_snapshot():
-    """Return account value + available funds for Kraken, or None if not configured.
+    """Return account value + available funds (+ staked/Earn value) for Kraken, or None.
 
     Uses python-kraken-sdk's User.get_trade_balance(), which wraps Kraken's
-    TradeBalance REST endpoint.
+    TradeBalance REST endpoint, and (optionally) Earn.list_earn_allocations()
+    for staked funds.
 
-    - account_value   -> 'eb' (equivalent balance, combined)
-    - available_funds -> 'mf' (free margin) if present, else fall back to 'eb'
+    - account_value    -> 'eb' (equivalent balance, combined spot/margin balance)
+    - available_funds  -> 'mf' (free margin) if present, else fall back to 'eb'
+    - staked_value     -> total Earn allocations (staked assets) converted into
+                          KRAKEN_EARN_CONVERTED_ASSET if set, otherwise Kraken's
+                          default converted asset (typically USD).
     """
     api_key = os.getenv("KRAKEN_API_KEY")
     api_secret = os.getenv("KRAKEN_API_SECRET")
@@ -148,18 +160,67 @@ def get_kraken_snapshot():
 
     base_asset = os.getenv("KRAKEN_BASE_ASSET", "ZUSD")
 
+    # --- Spot trade balance (existing behavior) ---
     user = KrakenUser(key=api_key, secret=api_secret)
     tb = user.get_trade_balance(asset=base_asset)
 
     equivalent_balance = float(tb.get("eb", 0.0))
     free_margin = float(tb.get("mf", equivalent_balance))
 
-    return {
+    snapshot = {
         "name": "Kraken",
         "currency": base_asset,
         "account_value": equivalent_balance,
         "available_funds": free_margin,
     }
+
+    # --- Earn / staked balance (new behavior) ---
+    staked_value = None
+    staked_currency = None
+
+    if KrakenEarn is None:
+        # Older python-kraken-sdk version without Earn client.
+        logger.info(
+            "Kraken Earn client not available in python-kraken-sdk; "
+            "upgrade the package to include staked value."
+        )
+    else:
+        try:
+            earn_converted_asset = os.getenv("KRAKEN_EARN_CONVERTED_ASSET")
+
+            earn_client = KrakenEarn(key=api_key, secret=api_secret)
+
+            # We hide zero allocations so you only see actively staked funds.
+            kwargs = {
+                "hide_zero_allocations": True,
+            }
+            if earn_converted_asset:
+                kwargs["converted_asset"] = earn_converted_asset
+
+            allocations = earn_client.list_earn_allocations(**kwargs)
+            # Expected response keys include:
+            #   "converted_asset": "USD",
+            #   "total_allocated": "49.2398",
+            #   "total_rewarded": "0.0675",
+            total_allocated = allocations.get("total_allocated")
+
+            if total_allocated is not None:
+                staked_value = float(total_allocated)
+                staked_currency = allocations.get(
+                    "converted_asset",
+                    earn_converted_asset or base_asset,
+                )
+
+        except Exception:
+            # Don't kill the whole update if the Earn endpoint is flaky or
+            # permissions are missing/misconfigured.
+            logger.exception("Error fetching Kraken Earn (staked) allocations")
+
+    if staked_value is not None:
+        snapshot["staked_value"] = staked_value
+        snapshot["staked_currency"] = staked_currency or base_asset
+
+    return snapshot
 
 
 def get_oanda_snapshot():
@@ -219,6 +280,13 @@ def build_rows(snapshots, timestamp_str):
 
         rows.append([label_value, acct_val, timestamp_str])
         rows.append([label_available, avail, timestamp_str])
+
+        # Optional: staked / Earn value (currently only Kraken sets this)
+        staked_val = snap.get("staked_value")
+        if staked_val is not None:
+            staked_currency = snap.get("staked_currency", currency)
+            label_staked = f"{name}: Staked / Earn Value ({staked_currency})"
+            rows.append([label_staked, staked_val, timestamp_str])
 
     return rows
 
