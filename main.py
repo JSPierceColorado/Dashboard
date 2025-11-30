@@ -26,7 +26,7 @@ ALPACA_PAPER                = true/false (default: true)
 KRAKEN_API_KEY
 KRAKEN_API_SECRET
 KRAKEN_BASE_ASSET           = ZUSD by default (base currency for TradeBalance)
-KRAKEN_EARN_CONVERTED_ASSET = optional; currency (e.g. USD, ZUSD) to express staked/Earn value.
+KRAKEN_EARN_CONVERTED_ASSET = optional; currency (e.g. USD, EUR) to express staked/Earn value.
                               If not set, Kraken's default is used (typically USD).
 
 OANDA_API_KEY
@@ -54,6 +54,12 @@ try:
     from kraken.spot import Earn as KrakenEarn  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover
     KrakenEarn = None  # type: ignore[assignment]
+
+try:
+    # For catching the specific "invalid arguments" error from Earn.
+    from kraken.exceptions import KrakenInvalidArgumentsError  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    KrakenInvalidArgumentsError = Exception  # type: ignore[assignment]
 
 import oandapyV20
 import oandapyV20.endpoints.accounts as oanda_accounts
@@ -112,7 +118,7 @@ def get_dashboard_worksheet(gc):
 def get_alpaca_snapshot():
     """Return account value + available funds for Alpaca, or None if not configured.
 
-    - account_value  -> account.equity
+    - account_value   -> account.equity
     - available_funds -> account.buying_power
     """
     api_key = os.getenv("ALPACA_API_KEY")
@@ -175,46 +181,64 @@ def get_kraken_snapshot():
     }
 
     # --- Earn / staked balance (new behavior) ---
-    staked_value = None
-    staked_currency = None
-
     if KrakenEarn is None:
         # Older python-kraken-sdk version without Earn client.
         logger.info(
             "Kraken Earn client not available in python-kraken-sdk; "
             "upgrade the package to include staked value."
         )
-    else:
-        try:
-            earn_converted_asset = os.getenv("KRAKEN_EARN_CONVERTED_ASSET")
+        return snapshot
 
-            earn_client = KrakenEarn(key=api_key, secret=api_secret)
+    staked_value = None
+    staked_currency = None
 
-            # We hide zero allocations so you only see actively staked funds.
-            kwargs = {
-                "hide_zero_allocations": True,
+    try:
+        earn_client = KrakenEarn(key=api_key, secret=api_secret)
+
+        # Optional: let user choose converted asset; normalize a few common "Z*" codes.
+        earn_converted_asset = os.getenv("KRAKEN_EARN_CONVERTED_ASSET")
+        kwargs: dict = {}
+
+        if earn_converted_asset:
+            normalized = earn_converted_asset.upper()
+            alias_map = {
+                "ZUSD": "USD",
+                "ZEUR": "EUR",
+                "ZGBP": "GBP",
+                "ZCAD": "CAD",
+                "ZAUD": "AUD",
+                "ZNZD": "NZD",
+                "ZJPY": "JPY",
             }
-            if earn_converted_asset:
-                kwargs["converted_asset"] = earn_converted_asset
+            normalized = alias_map.get(normalized, normalized)
+            kwargs["converted_asset"] = normalized
 
+        # You might want to hide old zero-balance allocations; we can try this,
+        # but if Kraken rejects the arguments, we fall back to a bare call.
+        kwargs["hide_zero_allocations"] = True
+
+        try:
             allocations = earn_client.list_earn_allocations(**kwargs)
-            # Expected response keys include:
-            #   "converted_asset": "USD",
-            #   "total_allocated": "49.2398",
-            #   "total_rewarded": "0.0675",
-            total_allocated = allocations.get("total_allocated")
+        except KrakenInvalidArgumentsError:
+            logger.warning(
+                "Kraken Earn allocations call failed due to invalid arguments; "
+                "retrying without parameters."
+            )
+            allocations = earn_client.list_earn_allocations()
 
-            if total_allocated is not None:
-                staked_value = float(total_allocated)
-                staked_currency = allocations.get(
-                    "converted_asset",
-                    earn_converted_asset or base_asset,
-                )
+        total_allocated = allocations.get("total_allocated")
 
-        except Exception:
-            # Don't kill the whole update if the Earn endpoint is flaky or
-            # permissions are missing/misconfigured.
-            logger.exception("Error fetching Kraken Earn (staked) allocations")
+        if total_allocated is not None:
+            staked_value = float(total_allocated)
+            staked_currency = allocations.get(
+                "converted_asset",
+                earn_converted_asset or base_asset,
+            )
+
+    except Exception:
+        # Don't kill the whole update if the Earn endpoint is flaky or
+        # permissions are missing/misconfigured.
+        logger.exception("Error fetching Kraken Earn (staked) allocations")
 
     if staked_value is not None:
         snapshot["staked_value"] = staked_value
@@ -316,7 +340,11 @@ def update_sheet_once():
     cell_range = f"A{start_row}:C{end_row}"
 
     logger.info("Updating range %s with %d rows", cell_range, len(rows))
-    ws.update(cell_range, rows, value_input_option="USER_ENTERED")
+    ws.update(
+        range_name=cell_range,
+        values=rows,
+        value_input_option="USER_ENTERED",
+    )
 
 
 # ---------- Main loop ----------
