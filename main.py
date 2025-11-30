@@ -26,8 +26,6 @@ ALPACA_PAPER                = true/false (default: true)
 KRAKEN_API_KEY
 KRAKEN_API_SECRET
 KRAKEN_BASE_ASSET           = ZUSD by default (base currency for TradeBalance)
-KRAKEN_EARN_CONVERTED_ASSET = optional; currency (e.g. USD, EUR) to express staked/Earn value.
-                              If not set, Kraken's default is used (typically USD).
 
 OANDA_API_KEY
 OANDA_ACCOUNT_ID
@@ -48,19 +46,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from alpaca.trading.client import TradingClient
-from kraken.spot import User as KrakenUser
-try:
-    # Earn client may not exist in older python-kraken-sdk versions; handle gracefully.
-    from kraken.spot import Earn as KrakenEarn  # type: ignore[attr-defined]
-except ImportError:  # pragma: no cover
-    KrakenEarn = None  # type: ignore[assignment]
-
-try:
-    # For catching the specific "invalid arguments" error from Earn.
-    from kraken.exceptions import KrakenInvalidArgumentsError  # type: ignore[attr-defined]
-except ImportError:  # pragma: no cover
-    KrakenInvalidArgumentsError = Exception  # type: ignore[assignment]
-
+from kraken.spot import User as KrakenUser, Market as KrakenMarket
 import oandapyV20
 import oandapyV20.endpoints.accounts as oanda_accounts
 
@@ -118,7 +104,7 @@ def get_dashboard_worksheet(gc):
 def get_alpaca_snapshot():
     """Return account value + available funds for Alpaca, or None if not configured.
 
-    - account_value   -> account.equity
+    - account_value  -> account.equity
     - available_funds -> account.buying_power
     """
     api_key = os.getenv("ALPACA_API_KEY")
@@ -144,18 +130,153 @@ def get_alpaca_snapshot():
     }
 
 
+def _kraken_base_alt_name(base_asset: str) -> str:
+    """Map Kraken internal fiat codes (ZUSD, ZEUR, ...) to their alt 'human' codes."""
+    mapping = {
+        "ZUSD": "USD",
+        "ZEUR": "EUR",
+        "ZGBP": "GBP",
+        "ZCAD": "CAD",
+        "ZAUD": "AUD",
+        "ZJPY": "JPY",
+        "ZCHF": "CHF",
+    }
+    return mapping.get(base_asset, base_asset)
+
+
+def get_kraken_earn_wallet_value(user: KrakenUser, base_asset: str) -> float:
+    """Return the total value (in base_asset) of Kraken *Earn wallet* balances.
+
+    Strategy:
+    - Query balances from Kraken (Balance or BalanceEx).
+    - Treat assets ending with:
+        - '.B' -> new yield-bearing products (Earn)
+        - '.S' -> staked balances
+        - '.M' -> opt-in rewards
+      as part of the Earn / staking wallet.
+    - EXCLUDE '.F' (balances earning automatically in Kraken Rewards / Auto Earn).
+    - Convert each such asset into base_asset using spot tickers.
+    """
+    try:
+        # Try several balance methods so we work across python-kraken-sdk versions.
+        try:
+            balances = user.get_account_balance()  # type: ignore[attr-defined]
+        except AttributeError:
+            try:
+                balances = user.get_balance()  # type: ignore[attr-defined]
+            except AttributeError:
+                try:
+                    balances = user.get_balances()  # type: ignore[attr-defined]
+                except AttributeError:
+                    logger.warning(
+                        "Kraken User client has no balance method we recognize; "
+                        "Earn wallet value will be 0."
+                    )
+                    return 0.0
+    except Exception:
+        logger.exception("Error fetching Kraken balances for Earn wallet calculation")
+        return 0.0
+
+    # Normalize balances into {asset: float_amount}
+    earn_suffixes = (".B", ".S", ".M")
+    earn_balances = {}
+
+    for asset, entry in balances.items():
+        # Skip Auto Earn (.F) explicitly.
+        if isinstance(asset, str) and asset.endswith(".F"):
+            continue
+
+        if not isinstance(asset, str):
+            continue
+
+        if not any(asset.endswith(sfx) for sfx in earn_suffixes):
+            continue
+
+        # Entry may be a simple string (Balance) or a dict (BalanceEx).
+        if isinstance(entry, dict):
+            amount_str = entry.get("balance", "0")
+        else:
+            amount_str = entry
+
+        try:
+            amount = float(amount_str)
+        except (TypeError, ValueError):
+            continue
+
+        if amount <= 0:
+            continue
+
+        earn_balances[asset] = amount
+
+    if not earn_balances:
+        return 0.0
+
+    # Convert these Earn balances into base_asset using Market tickers.
+    market = KrakenMarket()  # unauthenticated is fine for public price data
+    base_alt = _kraken_base_alt_name(base_asset)
+
+    total_value = 0.0
+    price_cache = {}
+
+    for asset_with_suffix, amount in earn_balances.items():
+        # Strip suffix: 'DOT.B' -> 'DOT'
+        underlying = asset_with_suffix.split(".", 1)[0]
+
+        # If underlying is already the base asset (ZUSD) or its alt (USD),
+        # we can just add the amount directly.
+        if underlying == base_asset or underlying == base_alt:
+            total_value += amount
+            continue
+
+        # Cache prices per underlying to avoid repeated ticker calls.
+        if underlying in price_cache:
+            price = price_cache[underlying]
+        else:
+            pair_alt = f"{underlying}{base_alt}"  # e.g. 'DOTUSD', 'XBTUSD'
+            try:
+                ticker = market.get_ticker(pair=pair_alt)
+            except Exception:
+                logger.exception(
+                    "Error fetching Kraken price for %s/%s when valuing Earn wallet",
+                    underlying,
+                    base_asset,
+                )
+                continue
+
+            if not ticker:
+                logger.warning(
+                    "No ticker data returned for Kraken pair %s; skipping from Earn wallet",
+                    pair_alt,
+                )
+                continue
+
+            # get_ticker returns dict like {'XXBTZUSD': {...}}
+            try:
+                first_key = next(iter(ticker))
+                last_trade_close = ticker[first_key]["c"][0]
+                price = float(last_trade_close)
+            except Exception:
+                logger.exception(
+                    "Unexpected ticker format for pair %s when valuing Earn wallet",
+                    pair_alt,
+                )
+                continue
+
+            price_cache[underlying] = price
+
+        total_value += amount * price
+
+    return total_value
+
+
 def get_kraken_snapshot():
-    """Return account value + available funds (+ staked/Earn value) for Kraken, or None.
+    """Return account value + available funds for Kraken, plus Earn wallet value.
 
-    Uses python-kraken-sdk's User.get_trade_balance(), which wraps Kraken's
-    TradeBalance REST endpoint, and (optionally) Earn.list_earn_allocations()
-    for staked funds.
+    Uses python-kraken-sdk's User.get_trade_balance() for:
+    - account_value   -> 'eb' (equivalent balance, combined)
+    - available_funds -> 'mf' (free margin) if present, else fall back to 'eb'
 
-    - account_value    -> 'eb' (equivalent balance, combined spot/margin balance)
-    - available_funds  -> 'mf' (free margin) if present, else fall back to 'eb'
-    - staked_value     -> total Earn allocations (staked assets) converted into
-                          KRAKEN_EARN_CONVERTED_ASSET if set, otherwise Kraken's
-                          default converted asset (typically USD).
+    And computes Earn wallet value separately (excluding Auto Earn) using balances.
     """
     api_key = os.getenv("KRAKEN_API_KEY")
     api_secret = os.getenv("KRAKEN_API_SECRET")
@@ -166,12 +287,18 @@ def get_kraken_snapshot():
 
     base_asset = os.getenv("KRAKEN_BASE_ASSET", "ZUSD")
 
-    # --- Spot trade balance (existing behavior) ---
     user = KrakenUser(key=api_key, secret=api_secret)
     tb = user.get_trade_balance(asset=base_asset)
 
     equivalent_balance = float(tb.get("eb", 0.0))
     free_margin = float(tb.get("mf", equivalent_balance))
+
+    earn_wallet_value = 0.0
+    try:
+        earn_wallet_value = get_kraken_earn_wallet_value(user, base_asset)
+    except Exception:
+        logger.exception("Error computing Kraken Earn wallet value")
+        earn_wallet_value = 0.0
 
     snapshot = {
         "name": "Kraken",
@@ -180,69 +307,9 @@ def get_kraken_snapshot():
         "available_funds": free_margin,
     }
 
-    # --- Earn / staked balance (new behavior) ---
-    if KrakenEarn is None:
-        # Older python-kraken-sdk version without Earn client.
-        logger.info(
-            "Kraken Earn client not available in python-kraken-sdk; "
-            "upgrade the package to include staked value."
-        )
-        return snapshot
-
-    staked_value = None
-    staked_currency = None
-
-    try:
-        earn_client = KrakenEarn(key=api_key, secret=api_secret)
-
-        # Optional: let user choose converted asset; normalize a few common "Z*" codes.
-        earn_converted_asset = os.getenv("KRAKEN_EARN_CONVERTED_ASSET")
-        kwargs: dict = {}
-
-        if earn_converted_asset:
-            normalized = earn_converted_asset.upper()
-            alias_map = {
-                "ZUSD": "USD",
-                "ZEUR": "EUR",
-                "ZGBP": "GBP",
-                "ZCAD": "CAD",
-                "ZAUD": "AUD",
-                "ZNZD": "NZD",
-                "ZJPY": "JPY",
-            }
-            normalized = alias_map.get(normalized, normalized)
-            kwargs["converted_asset"] = normalized
-
-        # You might want to hide old zero-balance allocations; we can try this,
-        # but if Kraken rejects the arguments, we fall back to a bare call.
-        kwargs["hide_zero_allocations"] = True
-
-        try:
-            allocations = earn_client.list_earn_allocations(**kwargs)
-        except KrakenInvalidArgumentsError:
-            logger.warning(
-                "Kraken Earn allocations call failed due to invalid arguments; "
-                "retrying without parameters."
-            )
-            allocations = earn_client.list_earn_allocations()
-
-        total_allocated = allocations.get("total_allocated")
-
-        if total_allocated is not None:
-            staked_value = float(total_allocated)
-            staked_currency = allocations.get(
-                "converted_asset",
-                earn_converted_asset or base_asset,
-            )
-
-    except Exception:
-        # Don't kill the whole update if the Earn endpoint is flaky or
-        # permissions are missing/misconfigured.
-        logger.exception("Error fetching Kraken Earn (staked) allocations")
-
-    if staked_value is not None:
-        snapshot["staked_value"] = staked_value
-        snapshot["staked_currency"] = staked_currency or base_asset
+    # Only include Earn wallet value if it's positive (non-trivial).
+    if earn_wallet_value > 0:
+        snapshot["earn_wallet_value"] = earn_wallet_value
 
     return snapshot
 
@@ -305,12 +372,11 @@ def build_rows(snapshots, timestamp_str):
         rows.append([label_value, acct_val, timestamp_str])
         rows.append([label_available, avail, timestamp_str])
 
-        # Optional: staked / Earn value (currently only Kraken sets this)
-        staked_val = snap.get("staked_value")
-        if staked_val is not None:
-            staked_currency = snap.get("staked_currency", currency)
-            label_staked = f"{name}: Staked / Earn Value ({staked_currency})"
-            rows.append([label_staked, staked_val, timestamp_str])
+        # Optional: Kraken Earn wallet value (excluding Auto Earn)
+        earn_wallet_value = snap.get("earn_wallet_value")
+        if earn_wallet_value is not None:
+            label_earn = f"{name}: Earn Wallet Value ({currency})"
+            rows.append([label_earn, earn_wallet_value, timestamp_str])
 
     return rows
 
@@ -340,6 +406,7 @@ def update_sheet_once():
     cell_range = f"A{start_row}:C{end_row}"
 
     logger.info("Updating range %s with %d rows", cell_range, len(rows))
+    # Use named arguments to avoid the DeprecationWarning from gspread.
     ws.update(
         range_name=cell_range,
         values=rows,
