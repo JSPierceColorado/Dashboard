@@ -47,6 +47,17 @@ from google.oauth2.service_account import Credentials
 
 from alpaca.trading.client import TradingClient
 from kraken.spot import User as KrakenUser, Market as KrakenMarket
+
+# Kraken custom exceptions (gracefully degrade if not present)
+try:
+    from kraken.exceptions import (
+        KrakenUnknownAssetError,
+        KrakenUnknownAssetPairError,
+    )
+except ImportError:  # pragma: no cover
+    KrakenUnknownAssetError = Exception  # type: ignore[assignment]
+    KrakenUnknownAssetPairError = Exception  # type: ignore[assignment]
+
 import oandapyV20
 import oandapyV20.endpoints.accounts as oanda_accounts
 
@@ -65,6 +76,7 @@ logger = logging.getLogger("account-dashboard-bot")
 
 # ---------- Time helpers ----------
 
+
 def get_mountain_timestamp() -> str:
     """Return current time in America/Denver as a nice string."""
     tz = pytz.timezone("America/Denver")
@@ -73,6 +85,7 @@ def get_mountain_timestamp() -> str:
 
 
 # ---------- Google Sheets helpers ----------
+
 
 def get_gspread_client():
     """Create an authenticated gspread client using a service account JSON in env."""
@@ -101,10 +114,11 @@ def get_dashboard_worksheet(gc):
 
 # ---------- Broker API helpers ----------
 
+
 def get_alpaca_snapshot():
     """Return account value + available funds for Alpaca, or None if not configured.
 
-    - account_value  -> account.equity
+    - account_value   -> account.equity
     - available_funds -> account.buying_power
     """
     api_key = os.getenv("ALPACA_API_KEY")
@@ -148,17 +162,18 @@ def get_kraken_earn_wallet_value(user: KrakenUser, base_asset: str) -> float:
     """Return the total value (in base_asset) of Kraken *Earn wallet* balances.
 
     Strategy:
-    - Query balances from Kraken (Balance or BalanceEx).
+    - Query balances from Kraken (Balance / BalanceEx via python-kraken-sdk User).
     - Treat assets ending with:
         - '.B' -> new yield-bearing products (Earn)
         - '.S' -> staked balances
         - '.M' -> opt-in rewards
       as part of the Earn / staking wallet.
-    - EXCLUDE '.F' (balances earning automatically in Kraken Rewards / Auto Earn).
+    - EXCLUDE '.F' (Auto Earn / Rewards) so we only get dedicated Earn wallet.
+      See Kraken symbol extensions doc. 
     - Convert each such asset into base_asset using spot tickers.
     """
+    # Fetch balances using whatever method the installed SDK exposes
     try:
-        # Try several balance methods so we work across python-kraken-sdk versions.
         try:
             balances = user.get_account_balance()  # type: ignore[attr-defined]
         except AttributeError:
@@ -169,17 +184,17 @@ def get_kraken_earn_wallet_value(user: KrakenUser, base_asset: str) -> float:
                     balances = user.get_balances()  # type: ignore[attr-defined]
                 except AttributeError:
                     logger.warning(
-                        "Kraken User client has no balance method we recognize; "
-                        "Earn wallet value will be 0."
+                        "Kraken User client has no recognized balance method; "
+                        "Earn wallet value will be reported as 0."
                     )
                     return 0.0
     except Exception:
         logger.exception("Error fetching Kraken balances for Earn wallet calculation")
         return 0.0
 
-    # Normalize balances into {asset: float_amount}
+    # Normalize balances into {asset: float_amount}, keeping only Earn-wallet suffixes
     earn_suffixes = (".B", ".S", ".M")
-    earn_balances = {}
+    earn_balances: dict[str, float] = {}
 
     for asset, entry in balances.items():
         # Skip Auto Earn (.F) explicitly.
@@ -216,11 +231,19 @@ def get_kraken_earn_wallet_value(user: KrakenUser, base_asset: str) -> float:
     base_alt = _kraken_base_alt_name(base_asset)
 
     total_value = 0.0
-    price_cache = {}
+    price_cache: dict[str, float] = {}
 
     for asset_with_suffix, amount in earn_balances.items():
-        # Strip suffix: 'DOT.B' -> 'DOT'
-        underlying = asset_with_suffix.split(".", 1)[0]
+        # Strip suffix: 'DOT.B' -> 'DOT', 'ETH2.S' -> 'ETH2'
+        underlying_raw = asset_with_suffix.split(".", 1)[0]
+
+        # Map legacy / derived tickers to a priceable underlying.
+        # Example: ETH2 represents staked ETH; treat it as normal ETH. 
+        underlying_aliases = {
+            "ETH2": "ETH",
+            "XETH2": "ETH",
+        }
+        underlying = underlying_aliases.get(underlying_raw, underlying_raw)
 
         # If underlying is already the base asset (ZUSD) or its alt (USD),
         # we can just add the amount directly.
@@ -232,9 +255,18 @@ def get_kraken_earn_wallet_value(user: KrakenUser, base_asset: str) -> float:
         if underlying in price_cache:
             price = price_cache[underlying]
         else:
-            pair_alt = f"{underlying}{base_alt}"  # e.g. 'DOTUSD', 'XBTUSD'
+            pair_alt = f"{underlying}{base_alt}"  # e.g. 'DOTUSD', 'ETHUSD'
             try:
                 ticker = market.get_ticker(pair=pair_alt)
+            except (KrakenUnknownAssetError, KrakenUnknownAssetPairError):
+                logger.warning(
+                    "Kraken pair %s/%s not found when valuing Earn wallet; "
+                    "skipping asset %s",
+                    underlying,
+                    base_asset,
+                    asset_with_suffix,
+                )
+                continue
             except Exception:
                 logger.exception(
                     "Error fetching Kraken price for %s/%s when valuing Earn wallet",
@@ -245,12 +277,13 @@ def get_kraken_earn_wallet_value(user: KrakenUser, base_asset: str) -> float:
 
             if not ticker:
                 logger.warning(
-                    "No ticker data returned for Kraken pair %s; skipping from Earn wallet",
+                    "No ticker data returned for Kraken pair %s; "
+                    "skipping asset %s from Earn wallet",
                     pair_alt,
+                    asset_with_suffix,
                 )
                 continue
 
-            # get_ticker returns dict like {'XXBTZUSD': {...}}
             try:
                 first_key = next(iter(ticker))
                 last_trade_close = ticker[first_key]["c"][0]
@@ -349,6 +382,7 @@ def get_oanda_snapshot():
 
 # ---------- Sheet writing ----------
 
+
 def build_rows(snapshots, timestamp_str):
     """Convert snapshots into rows for the sheet starting at row 5.
 
@@ -415,6 +449,7 @@ def update_sheet_once():
 
 
 # ---------- Main loop ----------
+
 
 def main():
     """Entry-point for Railway.
